@@ -24,6 +24,20 @@ except Exception:
     XGBRegressor = None
     HAS_XGBOOST = False
 
+try:
+    from lightgbm import LGBMRegressor  # type: ignore[reportMissingImports]
+    HAS_LIGHTGBM = True
+except Exception:
+    LGBMRegressor = None
+    HAS_LIGHTGBM = False
+
+try:
+    import optuna  # type: ignore[reportMissingImports]
+    HAS_OPTUNA = True
+except Exception:
+    optuna = None
+    HAS_OPTUNA = False
+
 RANDOM_STATE = 42
 TRAIN_PATH = "train.csv"
 TEST_PATH = "test.csv"
@@ -31,6 +45,7 @@ SAMPLE_SUB_PATH = "sample_submission.csv"
 CV_SPLITS = 5
 XGB_SEARCH_ITERS = 30
 GBR_SEARCH_ITERS = 30
+LGBM_SEARCH_ITERS = 30
 CATBOOST_RANDOM_TRIALS = 12
 BLEND_RANDOM_SEARCH_ITERS = 4000
 
@@ -56,6 +71,11 @@ APPROACH_NOTES = {
         "why": "Tree boosting with strong regularization and flexible depth/learning-rate tradeoffs often performs strongly on tabular Kaggle tasks.",
         "how": "Trains an XGBoost regressor on preprocessed features, tuned with randomized CV search to reduce RMSE.",
         "drawbacks": "Can overfit if not tuned; training time and memory are higher than linear models.",
+    },
+    "Model 2: LightGBM": {
+        "why": "LightGBM is efficient for large, sparse one-hot feature spaces and often provides strong tabular RMSE with fast training.",
+        "how": "Trains a LightGBM regressor on the same preprocessed features and tunes hyperparameters with CV to improve generalization.",
+        "drawbacks": "Sensitive to hyperparameters and can overfit on noisy features without careful regularization.",
     },
     "Model 2: AdvancedBlend": {
         "why": "Combining complementary boosted models can reduce variance and improve leaderboard stability.",
@@ -269,6 +289,43 @@ def optimize_multi_blend_weights(
     return best_weights, best_rmse
 
 
+def optimize_multi_blend_weights_optuna(
+    y_true: pd.Series,
+    candidate_preds: list[np.ndarray],
+    random_state: int,
+    n_trials: int = 120,
+) -> tuple[np.ndarray, float]:
+    """Use Optuna to optimize convex blend weights; falls back to random search if unavailable."""
+    if not HAS_OPTUNA:
+        return optimize_multi_blend_weights(
+            y_true=y_true,
+            candidate_preds=candidate_preds,
+            random_state=random_state,
+            n_samples=BLEND_RANDOM_SEARCH_ITERS,
+        )
+
+    preds = [np.asarray(p, dtype=float) for p in candidate_preds]
+    n_models = len(preds)
+
+    def objective(trial) -> float:
+        raw = np.array([trial.suggest_float(f"w{i}", 0.0, 1.0) for i in range(n_models)], dtype=float)
+        if np.sum(raw) <= 1e-12:
+            raw = np.ones(n_models, dtype=float)
+        w = raw / np.sum(raw)
+        blended = np.sum([w[i] * preds[i] for i in range(n_models)], axis=0)
+        return float(np.sqrt(mean_squared_error(y_true, blended)))
+
+    sampler = optuna.samplers.TPESampler(seed=random_state)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    best_raw = np.array([study.best_params[f"w{i}"] for i in range(n_models)], dtype=float)
+    if np.sum(best_raw) <= 1e-12:
+        best_raw = np.ones(n_models, dtype=float)
+    best_weights = best_raw / np.sum(best_raw)
+    return best_weights, float(study.best_value)
+
+
 def get_approach2_notes(model2_label: str) -> dict:
     if model2_label in APPROACH_NOTES:
         return APPROACH_NOTES[model2_label]
@@ -276,6 +333,8 @@ def get_approach2_notes(model2_label: str) -> dict:
         return APPROACH_NOTES["Model 2: AdvancedBoosting"]
     if "XGBoost" in model2_label:
         return APPROACH_NOTES["Model 2: XGBoost"]
+    if "LightGBM" in model2_label:
+        return APPROACH_NOTES["Model 2: LightGBM"]
     if "Blend" in model2_label:
         return APPROACH_NOTES["Model 2: AdvancedBlend"]
     return APPROACH_NOTES["Model 2: GradientBoosting"]
@@ -659,6 +718,68 @@ def main() -> None:
             }
         )
 
+    if HAS_LIGHTGBM:
+        print("Training advanced candidate: LightGBM (RandomizedSearchCV)")
+        lgbm_base = Pipeline(
+            steps=[
+                ("preprocessor", build_preprocessor(X_train, scale_numeric=False)),
+                (
+                    "regressor",
+                    LGBMRegressor(
+                        objective="regression",
+                        random_state=RANDOM_STATE,
+                        n_estimators=1200,
+                        learning_rate=0.03,
+                        max_depth=-1,
+                        subsample=0.85,
+                        colsample_bytree=0.85,
+                        reg_alpha=0.0,
+                        reg_lambda=0.0,
+                        n_jobs=-1,
+                        verbosity=-1,
+                    ),
+                ),
+            ]
+        )
+        lgbm_cv = KFold(n_splits=CV_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+        lgbm_param_distributions = {
+            "regressor__n_estimators": [600, 900, 1200, 1600, 2000],
+            "regressor__learning_rate": [0.01, 0.02, 0.03, 0.05],
+            "regressor__num_leaves": [31, 63, 95, 127, 191],
+            "regressor__max_depth": [-1, 6, 8, 10, 12],
+            "regressor__subsample": [0.65, 0.8, 0.9, 1.0],
+            "regressor__colsample_bytree": [0.65, 0.8, 0.9, 1.0],
+            "regressor__min_child_samples": [10, 20, 30, 50],
+            "regressor__reg_alpha": [0.0, 0.01, 0.1, 0.5],
+            "regressor__reg_lambda": [0.0, 0.01, 0.1, 0.5, 1.0],
+        }
+        lgbm_tuner = RandomizedSearchCV(
+            estimator=lgbm_base,
+            param_distributions=lgbm_param_distributions,
+            n_iter=LGBM_SEARCH_ITERS,
+            scoring="neg_root_mean_squared_error",
+            cv=lgbm_cv,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            verbose=0,
+        )
+        lgbm_tuner.fit(X_train, y_train)
+        lgbm_model = lgbm_tuner.best_estimator_
+        lgbm_pred = lgbm_model.predict(X_val)
+        lgbm_rmse = float(np.sqrt(mean_squared_error(y_val, lgbm_pred)))
+        print(f"LightGBM best CV RMSE: {-lgbm_tuner.best_score_:.6f}")
+        print(f"LightGBM validation RMSE: {lgbm_rmse:.6f}")
+        advanced_candidates.append(
+            {
+                "kind": "LightGBM",
+                "label": "Model 2: LightGBM",
+                "model": lgbm_model,
+                "pred": lgbm_pred,
+                "rmse": lgbm_rmse,
+                "best_params": lgbm_tuner.best_params_,
+            }
+        )
+
     print("Training advanced candidate: GradientBoosting (RandomizedSearchCV fallback/benchmark)")
     gbr_base = Pipeline(
         steps=[
@@ -723,11 +844,11 @@ def main() -> None:
     if len(advanced_candidates) >= 2:
         top_blend_candidates = advanced_candidates[: min(3, len(advanced_candidates))]
         blend_preds = [c["pred"] for c in top_blend_candidates]
-        blend_weights, blend_rmse_adv = optimize_multi_blend_weights(
-            y_val,
-            blend_preds,
+        blend_weights, blend_rmse_adv = optimize_multi_blend_weights_optuna(
+            y_true=y_val,
+            candidate_preds=blend_preds,
             random_state=RANDOM_STATE,
-            n_samples=BLEND_RANDOM_SEARCH_ITERS,
+            n_trials=120,
         )
 
         blend_desc = " + ".join(
@@ -783,7 +904,7 @@ def main() -> None:
     plot_residuals(y_val, y_pred2, "residual_plot_model2.png")
     if model2_kind == "CatBoost":
         plot_feature_importance(model2, "feature_importance_model2.png", top_n=20, feature_names=X.columns.tolist())
-    elif model2_kind in {"XGBoost", "GradientBoosting"}:
+    elif model2_kind in {"XGBoost", "GradientBoosting", "LightGBM"}:
         plot_feature_importance(model2, "feature_importance_model2.png", top_n=20)
     else:
         print("Skipping single-model feature importance plot for blended Model 2.")
@@ -809,21 +930,22 @@ def main() -> None:
         X_full_cb, X_test_cb, _, cat_cols_full = prepare_catboost_full_inputs(X, X_test)
         full_iterations = int(model2.get_best_iteration()) if model2.get_best_iteration() is not None else 1500
         full_iterations = max(full_iterations, 300)
+        cat_best_params = best_candidate.get("best_params", {})
         model2_full = CatBoostRegressor(
             loss_function="RMSE",
             random_seed=RANDOM_STATE,
-            depth=8,
-            learning_rate=0.03,
             iterations=full_iterations,
-            l2_leaf_reg=5.0,
-            bagging_temperature=0.5,
-            random_strength=1.0,
-            subsample=0.8,
+            depth=int(cat_best_params.get("depth", 8)),
+            learning_rate=float(cat_best_params.get("learning_rate", 0.03)),
+            l2_leaf_reg=float(cat_best_params.get("l2_leaf_reg", 5.0)),
+            bagging_temperature=float(cat_best_params.get("bagging_temperature", 0.5)),
+            random_strength=float(cat_best_params.get("random_strength", 1.0)),
+            subsample=float(cat_best_params.get("subsample", 0.8)),
             verbose=0,
         )
         model2_full.fit(X_full_cb, y, cat_features=cat_cols_full, verbose=False)
         test_pred2 = np.clip(model2_full.predict(X_test_cb), 0, 100)
-    elif model2_kind in {"XGBoost", "GradientBoosting"}:
+    elif model2_kind in {"XGBoost", "GradientBoosting", "LightGBM"}:
         model2.fit(X, y)
         test_pred2 = np.clip(model2.predict(X_test), 0, 100)
     elif model2_kind == "AdvancedBlend":
