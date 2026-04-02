@@ -1,0 +1,3 @@
+Submission, Private Score, Public Score
+submission_model1.csv, 12.1662, 11.9681
+submission_model2.csv, 11.6445, 11.5056
